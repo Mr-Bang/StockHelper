@@ -34,8 +34,18 @@ try:
 except Exception:
     pass
 
-REPORT_FILE = "今日报告.txt"   # 最新报告（每次覆盖），可用记事本打开
-REPORTS_DIR = "reports"        # 历史报告归档目录（按数据日期，全部保留）
+# 图表可选：装了 matplotlib 就画走势图，没装就只出文字报告（不报错）
+try:
+    import matplotlib
+    matplotlib.use("Agg")           # 不弹窗，直接存 PNG
+    import matplotlib.pyplot as plt
+    HAVE_MPL = True
+except Exception:
+    HAVE_MPL = False
+
+REPORT_FILE = "今日报告.md"     # 最新报告（每次覆盖），Markdown，可在 IDE 里渲染
+REPORTS_DIR = "reports"         # 历史报告归档目录（按数据日期，全部保留）
+CHARTS_DIR = "charts"           # 走势图 PNG 目录（被报告内嵌引用）
 
 # ============================================================================
 # 1) 配置区：想盯哪些股票，就在这里加/删代码（都用美股代码）
@@ -193,22 +203,28 @@ def vp_analysis(c, v):
     v5 = v.iloc[-5:].mean()
     v20 = v.iloc[-20:].mean()
     vol5_20 = (v5 / v20) if v20 else np.nan
+    expanding = (not np.isnan(vol5_20)) and vol5_20 > 1.05    # 近期总量在放大（仅作强度参考）
 
-    expanding = (not np.isnan(vol5_20)) and vol5_20 > 1.05    # 近期在放量
-    contracting = (not np.isnan(vol5_20)) and vol5_20 < 0.95  # 近期在缩量
+    # 关键：判断量在“买方”还是“卖方”——用 上涨日均量 / 下跌日均量。
+    # 这比单纯“总量放没放大”可靠得多：总量大也可能是恐慌性放量下跌（派发），那不健康。
+    updn = volume_quality(ret.dropna(), v.reindex(ret.index).dropna())  # >1 量在涨的那边
+    vol_buy = (not np.isnan(updn)) and updn >= 1.05      # 成交主要在上涨日：资金在买
+    vol_sell = (not np.isnan(updn)) and updn <= 0.95     # 成交主要在下跌日：资金在卖/派发
     up = price_chg > 2
     down = price_chg < -2
 
-    if up and expanding:
-        state, score, desc = "价涨量增", 2, "放量上涨——有资金真金白银在买，最健康，回调可加"
-    elif up and contracting:
-        state, score, desc = "价涨量缩", -2, "缩量上涨——涨得没量配合，多是虚涨/接近见顶，别追"
-    elif down and expanding:
-        state, score, desc = "价跌量增", -2, "放量下跌——抛压重，别接刀，持仓要警惕"
-    elif down and contracting:
-        state, score, desc = "价跌量缩", 1, "缩量回调——抛压在衰竭，趋势没坏的话是健康洗盘，回调到位"
+    if up and vol_buy:
+        state, score, desc = "价涨量增", 2, "放量上涨——上涨日成交更重，资金在买，最健康，回调可加"
+    elif up and vol_sell:
+        state, score, desc = "价涨量缩", -2, "涨但量在卖方——上涨缺量、下跌反而放量(派发嫌疑)，多是虚涨，别追"
+    elif up and not expanding:
+        state, score, desc = "价涨量缩", -1, "缩量上涨——涨得没量配合，谨慎追高"
+    elif down and vol_sell:
+        state, score, desc = "价跌量增", -2, "放量下跌——下跌日成交更重，抛压大，别接刀，持仓要警惕"
+    elif down and vol_buy:
+        state, score, desc = "价跌量缩", 1, "缩量回调——下跌缺量、回调有承接，趋势没坏的话是健康洗盘，回调到位"
     else:
-        state, score, desc = "量价平稳", 0, "近期量价没明显异动"
+        state, score, desc = "量价平稳", 0, "近期量价没明显方向"
 
     # --- OBV 顶背离：近20日价涨，但资金净流出 ---
     o = obv(c, v)
@@ -230,8 +246,7 @@ def vp_analysis(c, v):
 
     return {
         "state": state, "score": score, "desc": desc, "obv_div": obv_div,
-        "vol5_20": vol5_20, "quality": quality,
-        "updn": volume_quality(ret.dropna(), v.reindex(ret.index).dropna()),
+        "vol5_20": vol5_20, "quality": quality, "updn": updn,
     }
 
 
@@ -415,15 +430,16 @@ def sell_advice(m, heat, buy_price, shares):
     else:
         light, one = "🟡", f"暂时浮亏 {pnl:.1f}%，还没破止损 ${stop:.2f} → 按计划拿住；跌破止损价就走，别扛"
 
-    # 量价附注，让你看到为什么这么判
-    one += f"\n      量价：{vp['state']}——{vp['desc']}"
+    # 附注（量价 + 这笔盈亏金额），单独成行，便于 Markdown 排版
+    extras = []
+    vp_note = f"量价：{vp['state']}——{vp['desc']}"
     if vp["obv_div"]:
-        one += "；资金在净流出(OBV顶背离)"
-
+        vp_note += "；资金在净流出(OBV顶背离)"
+    extras.append(vp_note)
     if shares and not np.isnan(shares):
         pnl_money = (last - buy_price) * shares
-        one += f"\n      当前这笔约 {'+' if pnl_money >= 0 else ''}{pnl_money:,.0f} 美元"
-    return light, one, levels
+        extras.append(f"当前这笔约 {'+' if pnl_money >= 0 else ''}{pnl_money:,.0f} 美元")
+    return light, one, extras, levels
 
 
 # ============================================================================
@@ -488,73 +504,125 @@ def sector_of(t):
     return "其它"
 
 
-def print_report(metrics, heat, positions, as_of):
-    lines = []
-    out = lines.append   # 收集每一行，最后统一打印 + 存文件
+def make_chart(t, close, vol, outdir):
+    """画一只票最近~90天的 价格+MA20/MA50 与 成交量+20日均量，存成 PNG。
+    返回相对路径（供 Markdown 内嵌），失败返回 None。图内用英文标签避免中文字体缺失。"""
+    if not HAVE_MPL:
+        return None
+    try:
+        c_full = close[t].dropna()
+        ma20 = c_full.rolling(20).mean()
+        ma50 = c_full.rolling(50).mean()
+        v20 = vol[t].rolling(20).mean()
+        idx = c_full.index[-90:]
+        c, m20, m50 = c_full.reindex(idx), ma20.reindex(idx), ma50.reindex(idx)
+        v, vm20 = vol[t].reindex(idx), v20.reindex(idx)
 
-    line = "=" * 64
+        fig, (axp, axv) = plt.subplots(
+            2, 1, figsize=(9, 5), sharex=True,
+            gridspec_kw={"height_ratios": [2, 1]})
+        axp.plot(idx, c.values, color="#1f77b4", lw=1.7, label="Price")
+        axp.plot(idx, m20.values, color="grey", lw=1.0, ls="--", label="MA20")
+        axp.plot(idx, m50.values, color="black", lw=1.0, ls=":", label="MA50")
+        axp.set_title(f"{t}  (last ~90 sessions)")
+        axp.set_ylabel("Price ($)")
+        axp.legend(fontsize=8)
+        axp.grid(alpha=0.3)
+        axv.bar(idx, v.values, color="#bbbbbb", width=1.0)
+        axv.plot(idx, vm20.values, color="red", lw=1.3, label="Vol MA20")
+        axv.set_ylabel("Volume")
+        axv.legend(fontsize=8)
+        axv.grid(alpha=0.3)
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        os.makedirs(outdir, exist_ok=True)
+        path = os.path.join(outdir, f"{t}.png")
+        fig.savefig(path, dpi=110)
+        plt.close(fig)
+        return path.replace("\\", "/")
+    except Exception as e:
+        print(f"  （{t} 图表生成失败，不影响报告：{e}）")
+        return None
+
+
+def print_report(metrics, heat, positions, as_of, charts):
+    lines = []
+    out = lines.append   # 收集每一行，最后统一打印 + 存 Markdown 文件
+
+    out("# 📈 每日盯盘报告")
     out("")
-    out(line)
-    out(f"  每日盯盘报告　数据截至：{as_of}（开盘前最新可得的收盘价）")
-    out(line)
+    out(f"> 数据截至：**{as_of}**（开盘前最新可得的收盘价）")
+    out("")
 
     # ---- A. 我的持仓 ----
-    out("")
-    out("【一】我的持仓 —— 该拿 / 卖 / 止损？")
+    out("## 一、我的持仓 —— 该拿 / 卖 / 止损")
     out("")
     held = [t for t in positions if t in metrics]
     if not held:
-        out("  （持仓文件 my_positions.csv 里没有可识别的持仓，或这些代码不在下载范围内）")
+        out("_持仓文件 `my_positions.csv` 里没有可识别的持仓（或代码不在下载范围内）。_")
+        out("")
     for t in held:
         bp, sh = positions[t]
         m = metrics[t]
-        light, one, lv = sell_advice(m, heat.get(t, 0.0), bp, sh)
-        out(f"  {light} {name_of(t)}　[{sector_of(t)}]")
-        out(f"      {one}")
-        out(f"      现价 ${lv['现价']:.2f}｜成本 ${lv['成本']:.2f}｜盈亏 {lv['盈亏%']:+.1f}%")
-        out(f"      关键价位：止损 ${lv['止损价']:.2f}　|　止盈① ${lv['止盈一(卖1/3)']:.2f}　|　止盈② ${lv['止盈二(再卖一部分)']:.2f}")
+        light, one, extras, lv = sell_advice(m, heat.get(t, 0.0), bp, sh)
+        out(f"### {light} {name_of(t)} · {sector_of(t)}")
         out("")
+        out(f"**{one}**")
+        out("")
+        for e in extras:
+            out(f"- {e}")
+        out("")
+        out("| 现价 | 成本 | 盈亏 | 止损 | 止盈① | 止盈② |")
+        out("|---|---|---|---|---|---|")
+        out(f"| ${lv['现价']:.2f} | ${lv['成本']:.2f} | {lv['盈亏%']:+.1f}% | "
+            f"${lv['止损价']:.2f} | ${lv['止盈一(卖1/3)']:.2f} | ${lv['止盈二(再卖一部分)']:.2f} |")
+        out("")
+        if charts.get(t):
+            out(f"![{t} 走势]({charts[t]})")
+            out("")
 
     # ---- B. 观察名单（按板块，板块内按相对便宜→相对贵排序）----
-    out("")
-    out("【二】观察名单 —— 现在能不能加仓？（每个板块内部相互比）")
+    out("## 二、观察名单 —— 现在能不能加仓？（每个板块内部相互比）")
     out("")
     for sector, tickers in WATCHLIST.items():
         members = [t for t in tickers if t in metrics]
         if not members:
             continue
-        # 板块内：热度低（相对便宜）排前面
-        members.sort(key=lambda x: heat.get(x, 0.0))
-        out(f"  ── {sector} ──（从“板块里相对便宜”到“相对涨过头”排序）")
+        members.sort(key=lambda x: heat.get(x, 0.0))   # 板块内：相对便宜排前面
+        out(f"### {sector}")
+        out("")
+        out("_排序：从「板块里相对便宜」到「相对涨过头」_")
+        out("")
         for t in members:
             m = metrics[t]
             light, one, reasons = add_advice(m, heat.get(t, 0.0))
             hot = heat.get(t, 0.0)
-            tag = "🔥相对最热" if hot >= 1.0 else ("💧相对最便宜" if hot <= -0.6 else "·")
-            vptag = m["vp"]["state"]
-            if m["vp"]["obv_div"]:
-                vptag += "+资金流出"
+            tag = "🔥相对最热" if hot >= 1.0 else ("💧相对最便宜" if hot <= -0.6 else "")
+            vptag = m["vp"]["state"] + ("+资金流出" if m["vp"]["obv_div"] else "")
             r1m_s = f"{m['r1m']:+.1f}%" if not np.isnan(m["r1m"]) else "n/a"
             r3m_s = f"{m['r3m']:+.1f}%" if not np.isnan(m["r3m"]) else "n/a(历史短)"
-            out(f"    {light} {name_of(t):<16} 现价 ${m['last']:.2f}　近1月 {r1m_s}　近3月 {r3m_s}　[量价:{vptag}]　{tag}")
-            out(f"        建议：{one}")
-            out(f"        理由：{'；'.join(reasons)}")
+            tail = f" · {tag}" if tag else ""
+            out(f"- {light} **{name_of(t)}**　${m['last']:.2f}｜近1月 {r1m_s}｜近3月 {r3m_s}｜量价：{vptag}{tail}")
+            out(f"  - **建议**：{one}")
+            out(f"  - 理由：{'；'.join(reasons)}")
+            if charts.get(t) and t not in held:
+                out("")
+                out(f"  ![{t} 走势]({charts[t]})")
+                out("")
         out("")
 
-    out(line)
-    out("  说明：本工具只做数据辅助参考，不是投资保证。最终决策结合你的资金、")
-    out("        风险承受力和当天盘前/盘后实际报价。'涨过头'仅在同板块内相对比较。")
-    out("  改持仓：用 Excel 编辑 my_positions.csv　|　改盯盘股票：编辑 daily_check.py 顶部 WATCHLIST")
-    out(line)
+    out("---")
+    out("> ⚠️ 本工具只做数据辅助参考，**不是投资保证**。「涨过头」仅在同板块内相对比较。")
+    out("> 改持仓：编辑 `my_positions.csv`　|　改盯盘股票：编辑 `daily_check.py` 顶部 `WATCHLIST`")
 
     text = "\n".join(lines)
     print(text)
     try:
         with open(REPORT_FILE, "w", encoding="utf-8") as f:
             f.write(text + "\n")
-        # 再按数据日期归档一份到 reports/，历史报告全部保留，方便日后回看/对比
+        # 再按数据日期归档一份到 reports/，历史报告全部保留
         os.makedirs(REPORTS_DIR, exist_ok=True)
-        dated = os.path.join(REPORTS_DIR, f"报告_{as_of}.txt")
+        dated = os.path.join(REPORTS_DIR, f"报告_{as_of}.md")
         with open(dated, "w", encoding="utf-8") as f:
             f.write(text + "\n")
         print(f"\n（最新报告：{REPORT_FILE}　|　已归档：{dated}）")
@@ -592,7 +660,22 @@ def main():
     heat = sector_heat(metrics)
     positions = load_positions()
     as_of = close.index[-1].date()
-    print_report(metrics, heat, positions, as_of)
+
+    # 给「持仓」+「绿灯加仓候选」画走势图（数量有限，避免一堆图）
+    held = [t for t in positions if t in metrics]
+    green = [t for t in metrics if add_advice(metrics[t], heat.get(t, 0.0))[0] == "🟢"]
+    chart_list = list(dict.fromkeys(held + green))   # 去重保序
+    charts = {}
+    if HAVE_MPL and chart_list:
+        print(f"正在生成走势图（{len(chart_list)} 张）...")
+        for t in chart_list:
+            p = make_chart(t, close, vol, CHARTS_DIR)
+            if p:
+                charts[t] = p
+    elif not HAVE_MPL:
+        print("（未安装 matplotlib，跳过走势图；如需图表：pip install matplotlib）")
+
+    print_report(metrics, heat, positions, as_of, charts)
 
 
 if __name__ == "__main__":

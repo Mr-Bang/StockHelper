@@ -1,0 +1,4 @@
+# 每日盯盘助手依赖。安装：python -m pip install -r requirements.txt
+pandas>=2.2
+numpy>=1.26
+yfinance>=0.2.40
